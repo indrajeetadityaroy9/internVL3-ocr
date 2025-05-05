@@ -1,15 +1,18 @@
 """
-InternVL-3 OCR service:
-Optimized thread handling
-Simplified resource management
-Consolidated text output for multi-images
-single, reusable torchvision transform
-strict input-size guard & JSON safety
-unified device / dtype placement (float16 on CUDA, float32 on CPU)
-inference wrapped in `torch.no_grad()`
-autograd & Flash-Attn friendly flags
-16 MiB DoS-protection limit (base-64-inflated)
-ready for gunicorn --preload (model fork-safe)
+Robust OCR service using Qwen2-VL-OCR-2B-Instruct:
+- Follows official implementation patterns
+- Uses qwen-vl-utils for proper image processing
+- Includes proper exception handling and resource management
+
+Installation requirements:
+pip install transformers torch pillow flask
+pip install qwen-vl-utils
+
+Run (dev):
+  python ocr_service.py --host 0.0.0.0 --port 5001
+
+Run (prod):
+  gunicorn -w 1 -k gevent --preload ocr_service:app --bind 0.0.0.0:5001
 """
 
 from __future__ import annotations
@@ -31,17 +34,17 @@ import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union, Any
+
 import torch
-import torchvision.transforms as T
 from flask import Flask, jsonify, request
 from PIL import Image, ImageFile
-from torchvision.transforms.functional import InterpolationMode
 
 # Enable loading truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-IMAGENET_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-IMAGENET_STD: Tuple[float, float, float] = (0.229, 0.224, 0.225)
-IMAGE_SIZE: int = 448
+
+# ────────────────────────────
+# 1. Global configuration
+# ────────────────────────────
 MAX_UPLOAD_BYTES: int = 16 * 1024 * 1024  # 16 MiB (post-base64)
 DEBUG_MODE: bool = os.environ.get("OCR_DEBUG", "0") == "1"
 MAX_THREADS: int = 4  # Maximum number of concurrent OCR tasks
@@ -51,7 +54,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(process)d  %(name)s ▶  %(message)s",
 )
-log = logging.getLogger("internvl3-ocr")
+log = logging.getLogger("qwen-ocr")
 
 # Global variables
 tasks = {}  # Task dictionary
@@ -61,10 +64,14 @@ shutdown_requested = False  # Shutdown flag
 
 # Global model objects (always loaded)
 model = None
-tokenizer = None
+processor = None
 model_lock = threading.Lock()  # Lock for model access during inference
 thread_pool = None  # Thread pool for OCR tasks
 
+
+# ────────────────────────────
+# 2. Task Management
+# ────────────────────────────
 class Task:
     """Task representation"""
 
@@ -107,11 +114,13 @@ def create_task(image_data: bytes) -> str:
 
 
 def get_task(task_id: str) -> Optional[Task]:
+    """Get a task by its ID."""
     with task_lock:
         return tasks.get(task_id)
 
 
 def update_task(task_id: str, **kwargs) -> None:
+    """Update task properties."""
     with task_lock:
         if task_id in tasks:
             task = tasks[task_id]
@@ -125,6 +134,7 @@ def update_task(task_id: str, **kwargs) -> None:
 
 
 def cleanup_old_tasks(max_age: float = 3600) -> None:
+    """Remove completed tasks older than max_age seconds."""
     current_time = time.time()
     task_ids_to_remove = []
 
@@ -140,6 +150,7 @@ def cleanup_old_tasks(max_age: float = 3600) -> None:
 
 
 def remove_task(task_id: str) -> None:
+    """Remove a task and its associated data."""
     with task_lock:
         if task_id in tasks:
             task = tasks[task_id]
@@ -169,6 +180,7 @@ def init_thread_pool():
 
 
 def submit_task(task_id: str):
+    """Submit a task to the thread pool."""
     global thread_pool
 
     # Ensure thread pool is initialized
@@ -192,47 +204,69 @@ def handle_task_completion(future, task_id):
         update_task(task_id, status="failed", error=str(future.exception()))
 
 
+# ────────────────────────────
+# 3. Model Loading & OCR
+# ────────────────────────────
 def load_model():
-    global model, tokenizer
+    """Load the Qwen2-VL-OCR-2B-Instruct model following the official pattern."""
+    global model, processor
 
-    log.info("Loading model and tokenizer")
+    log.info("Loading Qwen2-VL-OCR-2B-Instruct model and processor")
     start_time = time.time()
 
-    # Import here to avoid loading unnecessarily
-    from transformers import AutoModel, AutoTokenizer
+    try:
+        # Import required modules
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
-    # Detect device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+        # Check if qwen_vl_utils is available
+        try:
+            import qwen_vl_utils
+            log.info("qwen_vl_utils package found")
+        except ImportError:
+            log.warning("qwen_vl_utils not found. Please install with: pip install qwen-vl-utils")
 
-    # Disable multiprocessing in tokenizers
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        # Set device - use CPU for better memory management if needed
+        if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory > 8 * 1024 ** 3:
+            device_map = "auto"  # Use CUDA when available with sufficient memory
+            dtype = torch.float16
+            log.info("Using CUDA with auto device mapping")
+        else:
+            device_map = "cpu"  # Force CPU for limited memory systems
+            dtype = torch.float32
+            log.info("Using CPU device mapping")
 
-    # Load model with optimized settings
-    model = (
-        AutoModel.from_pretrained(
-            "OpenGVLab/InternVL3-1B",
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            use_flash_attn=torch.cuda.is_available()
+        # Load processor first
+        processor = AutoProcessor.from_pretrained(
+            "prithivMLmods/Qwen2-VL-OCR-2B-Instruct",
+            use_fast=False
         )
-        .to(device=device, dtype=dtype)
-        .eval()
-    )
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        "OpenGVLab/InternVL3-1B",
-        trust_remote_code=True,
-        use_fast=False
-    )
+        # Load model with appropriate settings
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            "prithivMLmods/Qwen2-VL-OCR-2B-Instruct",
+            device_map=device_map,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True
+        )
 
-    load_time = time.time() - start_time
-    log.info(f"Model loaded successfully in {load_time:.2f} seconds")
+        # Set model to evaluation mode
+        model.eval()
+
+        # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        load_time = time.time() - start_time
+        log.info(f"Model loaded successfully in {load_time:.2f} seconds")
+
+    except Exception as e:
+        log.error(f"Failed to load model: {e}")
+        raise
 
 
 def process_ocr_task(task_id: str) -> None:
+    """Process a single OCR task."""
     log.info(f"Processing task {task_id}")
 
     # Get task
@@ -270,95 +304,112 @@ def process_ocr_task(task_id: str) -> None:
 
 
 def run_ocr(img: Image.Image) -> str:
-    global model, tokenizer
+    """Run OCR on an image using the Qwen2-VL-OCR-2B-Instruct model."""
+    global model, processor
 
     # Ensure model is loaded
-    if model is None or tokenizer is None:
+    if model is None or processor is None:
         raise RuntimeError("Model not loaded")
 
-    # Preprocess image
-    tensor = preprocess_image(img)
+    # Import qwen_vl_utils for processing
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError:
+        raise RuntimeError(
+            "Required package 'qwen_vl_utils' not found. Please install it with: pip install qwen-vl-utils")
 
     # Lock for thread safety during inference
     with model_lock:
-        # Run inference
-        prompt = (
-            "<image>\n"
-            "Please perform OCR on this image. "
-            "Extract every visible text region and output it verbatim."
-        )
+        try:
+            # Create a message with the image for OCR
+            prompt = (
+                "Extract text from this programming problem screenshot. "
+                "Ignore images and only focus on text. "
+                "Focus specifically on extracting: "
+                "1. The problem statement/description "
+                "2. Any example inputs and outputs "
+                "3. The exact function signature or method declaration "
+                "4. Any constraints or requirements. "
+                "Output the raw text only without any commentary."
+            )
 
-        gen_args = dict(
-            max_new_tokens=1024,
-            do_sample=False,
-            temperature=0.0,
-            top_p=1.0,
-            num_beams=1,
-        )
+            # Format message following Qwen's pattern
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": img  # Pass PIL image directly
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
 
-        # Run inference with torch.no_grad()
-        with torch.no_grad():
-            text = model.chat(tokenizer, tensor, prompt, gen_args)
+            # Process the message following the official pattern
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
 
-    return text
+            # Process image data
+            image_inputs, video_inputs = process_vision_info(messages)
 
+            # Prepare inputs for the model
+            inputs = processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
 
-def preprocess_image(img: Image.Image) -> torch.Tensor:
-    # Detect device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+            # Move inputs to the same device as model
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    # Create transform
-    transform = T.Compose([
-        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-        T.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+            # Run inference with torch.no_grad() to save memory
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    num_beams=1
+                )
 
-    # Handle small vs. large images
-    if img.width < IMAGE_SIZE * 2 and img.height < IMAGE_SIZE * 2:
-        # Small image - use direct resize
-        resized = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BICUBIC)
-        tensor = transform(resized).unsqueeze(0)
-        return tensor.to(device=device, dtype=dtype)
-    else:
-        # Larger image - use dynamic tiling
-        patches = dynamic_tiling(img)
-        return torch.stack([transform(p) for p in patches]).to(device=device, dtype=dtype)
+                # Trim the input ids to get only the generated part
+                # Fix: Access input_ids as a dictionary key, not an attribute
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+                ]
 
+                # Decode the generated text
+                output_text = processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True
+                )[0]  # Get first result
 
-def dynamic_tiling(img: Image.Image, max_tiles: int = 12, base: int = IMAGE_SIZE) -> List[Image.Image]:
-    w, h = img.size
-    aspect = w / h
-    best_err, tiling = 1e9, (1, 1)
+            # Clean up the text
+            output_text = output_text.strip()
 
-    # Find optimal tiling
-    for rows in range(1, max_tiles + 1):
-        cols = max_tiles // rows
-        if cols == 0:
-            continue
-        cand_aspect = cols / rows
-        err = abs(aspect - cand_aspect)
-        if rows * cols <= max_tiles and err < best_err:
-            best_err, tiling = err, (rows, cols)
+            return output_text
 
-    rows, cols = tiling
-    tile_w, tile_h = w / cols, h / rows
-    patches = []
+        except Exception as e:
+            log.exception(f"Error during OCR inference: {e}")
+            raise
+        finally:
+            # Force garbage collection after each inference
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    # Create patches
-    for r in range(rows):
-        for c in range(cols):
-            l, u = int(c * tile_w), int(r * tile_h)
-            rgt, dwn = int((c + 1) * tile_w), int((r + 1) * tile_h)
-            patch = img.crop((l, u, rgt, dwn)).resize((base, base), Image.BICUBIC)
-            patches.append(patch)
-
-    return patches
-
-
+# ────────────────────────────
+# 4. Image Processing
+# ────────────────────────────
 def decode_base64_image(b64: str) -> bytes:
+    """Decode base64-encoded image data to bytes."""
     import re
 
     # Handle both raw base64 and data URL formats
@@ -367,6 +418,7 @@ def decode_base64_image(b64: str) -> bytes:
         prefix, b64_clean = b64.split(",", 1)
         log.info("Detected data URL format with prefix: %s", prefix)
     else:
+        # Handle raw base64 without prefix (what the macOS app sends)
         b64_clean = b64
         log.info("Processing raw base64 data (no prefix)")
 
@@ -469,12 +521,16 @@ def get_image_from_request() -> Union[bytes, List[bytes]]:
     raise ValueError("No image provided in request")
 
 
+# ────────────────────────────
+# 5. Flask App
+# ────────────────────────────
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
 
 # Background thread for maintenance
 def maintenance_thread_func():
+    """Background thread for cleanup and maintenance."""
     log.info("Starting maintenance thread")
 
     while not shutdown_requested:
@@ -495,6 +551,7 @@ maintenance_thread_handle = None
 
 @app.route("/ocr", methods=["POST"])
 def ocr_endpoint():
+    """Handle OCR requests."""
     try:
         log.info("OCR request received")
 
@@ -604,6 +661,7 @@ def get_task_status(task_id):
 
 @app.route("/tasks/batch", methods=["POST"])
 def get_batch_status():
+    """Get the status of multiple tasks."""
     if not request.is_json:
         return jsonify(success=False, error="Expected JSON"), 400
 
@@ -639,6 +697,7 @@ def get_batch_status():
 
 @app.route("/consolidate", methods=["POST"])
 def consolidate_tasks():
+    """Consolidate text from multiple tasks into a single result."""
     if not request.is_json:
         return jsonify(success=False, error="Expected JSON"), 400
 
@@ -682,6 +741,7 @@ def consolidate_tasks():
 
 @app.route("/health")
 def health():
+    """Health check endpoint with enhanced status information."""
     # Get task stats
     task_count = len(tasks)
     task_status = {
@@ -717,7 +777,9 @@ def health():
         time=datetime.now().isoformat(),
         model={
             "status": model_status,
-            "always_loaded": True
+            "name": "Qwen2-VL-OCR-2B-Instruct",
+            "always_loaded": True,
+            "device": "cuda" if torch.cuda.is_available() else "cpu"
         },
         tasks={
             "total": task_count,
@@ -727,6 +789,10 @@ def health():
         threads=thread_info
     )
 
+
+# ────────────────────────────
+# 6. Cleanup
+# ────────────────────────────
 def cleanup_resources():
     """Clean up all resources."""
     global shutdown_requested, thread_pool
@@ -770,6 +836,9 @@ def cleanup_resources():
 atexit.register(cleanup_resources)
 
 
+# ────────────────────────────
+# 7. Shutdown handler
+# ────────────────────────────
 def graceful_shutdown(signum, frame):
     """Handle graceful shutdown."""
     log.info(f"Graceful shutdown initiated from signal {signum}")
@@ -788,6 +857,10 @@ def graceful_shutdown(signum, frame):
 signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
+
+# ────────────────────────────
+# 8. Entrypoint
+# ────────────────────────────
 def main(host: str, port: int, debug: bool = False, threads: int = MAX_THREADS):
     """Start the OCR service."""
     global DEBUG_MODE, MAX_THREADS, maintenance_thread_handle
@@ -799,9 +872,6 @@ def main(host: str, port: int, debug: bool = False, threads: int = MAX_THREADS):
     if debug:
         log.setLevel(logging.DEBUG)
         log.info("Debug mode enabled")
-
-    # Disable multiprocessing in transformers
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     # Create image store if it doesn't exist
     if not os.path.exists(image_store):
@@ -838,9 +908,9 @@ def main(host: str, port: int, debug: bool = False, threads: int = MAX_THREADS):
 
 if __name__ == "__main__":
     # Setup command line arguments
-    parser = argparse.ArgumentParser("Simplified OCR service with always-loaded model")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", default=5001, type=int)
+    parser = argparse.ArgumentParser("OCR service with Qwen2-VL-OCR-2B-Instruct")
+    parser.add_argument("--host", default="0.0.0.0", help="Host interface to bind to")
+    parser.add_argument("--port", default=5001, type=int, help="Port to listen on")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--threads", type=int, default=MAX_THREADS, help="Number of worker threads")
     args = parser.parse_args()
